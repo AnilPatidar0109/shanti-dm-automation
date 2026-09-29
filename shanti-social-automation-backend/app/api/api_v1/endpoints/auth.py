@@ -1,0 +1,494 @@
+from datetime import datetime, timedelta
+from typing import Any, List
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
+
+from app.core import security
+from app.core.config import settings
+from app.api import deps
+from app.db.repository import user_repo, instagram_account_repo, facebook_account_repo, post_repo, facebook_post_repo
+from app.utils.text import parse_iso_timestamp
+from app.schemas.user import Token, UserCreate, UserRegister, ForgotPasswordRequest
+from app.schemas.instagram import MetaOAuthPayload, InstagramAccount as InstagramAccountSchema
+from app.schemas.facebook import FacebookAccount as FacebookAccountSchema
+from app.integrations.meta.client import meta_client, MetaAPIError
+from app.models.user import User
+
+router = APIRouter()
+
+
+@router.post("/register", response_model=Token)
+async def register(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    user_in: UserRegister
+) -> Any:
+    """User registration flow."""
+    existing_user = await user_repo.get_by_email(db, email=user_in.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email address already exists. Please log in instead."
+        )
+    
+    new_user_data = {
+        "email": user_in.email,
+        "hashed_password": security.get_password_hash(user_in.password),
+        "first_name": user_in.first_name,
+        "last_name": user_in.last_name,
+        "business_name": user_in.business_name,
+        "country": user_in.country,
+        "account_type": user_in.account_type,
+        "is_active": True,
+        "is_superuser": False
+    }
+    user = await user_repo.create(db, obj_in=new_user_data)
+    await db.commit()
+    await db.refresh(user)
+
+    logger.info(f"Registered new ShantiDM user: {user.email} ({user.first_name} {user.last_name})")
+
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    payload: ForgotPasswordRequest
+) -> Any:
+    """Simulated password reset email sender."""
+    # We return success message to avoid email enumeration
+    return {
+        "message": f"If an account exists for {payload.email}, password reset instructions have been sent."
+    }
+
+
+@router.post("/login-json", response_model=Token)
+async def login_json(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    user_in: UserCreate
+) -> Any:
+    """JSON-based login flow."""
+    user = await user_repo.get_by_email(db, email=user_in.email)
+    if not user or not security.verify_password(user_in.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect email or password"
+        )
+    elif not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user"
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/login", response_model=Token)
+async def login_form(
+    db: AsyncSession = Depends(deps.get_db),
+    form_data: OAuth2PasswordRequestForm = Depends()
+) -> Any:
+    """OAuth2 password flow for OpenAPI/Swagger UI login."""
+    user = await user_repo.get_by_email(db, email=form_data.username)
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect email or password"
+        )
+    elif not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user"
+        )
+        
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+    }
+
+
+@router.post("/facebook-connect", response_model=List[InstagramAccountSchema])
+async def facebook_connect(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+    payload: MetaOAuthPayload
+) -> Any:
+    """
+    Connect user's Facebook account:
+    1. Exchange short-lived token for a long-lived user token.
+    2. Automatically discover Pages and connected Instagram accounts.
+    3. Encrypt and save accounts in the DB.
+    4. Fetch and cache recent media/posts for each discovered account.
+    """
+    try:
+        # Step 1: Exchange user token
+        long_lived_user_token = await meta_client.get_long_lived_user_token(payload.access_token)
+        
+        # Step 2: Auto-discover Instagram Business accounts
+        discovered_accounts = await meta_client.discover_accounts(long_lived_user_token)
+        
+        if not discovered_accounts:
+            raise HTTPException(
+                status_code=400,
+                detail="No Instagram Business Accounts found connected to your Facebook Pages. "
+                       "Please verify page setup."
+            )
+            
+        saved_accounts = []
+        saved_page_ids = set()
+        for disc in discovered_accounts:
+            # Check if account already connected by instagram_business_account_id or page_id
+            existing = await instagram_account_repo.get_by_instagram_id(
+                db, instagram_business_account_id=disc["instagram_business_account_id"]
+            )
+            if not existing:
+                existing = await instagram_account_repo.get_by_page_id(
+                    db, page_id=disc["page_id"]
+                )
+            
+            account_data = {
+                "user_id": current_user.id,
+                "instagram_business_account_id": disc["instagram_business_account_id"],
+                "page_id": disc["page_id"],
+                "username": disc["instagram_username"],
+                "name": disc["instagram_name"],
+                "profile_picture_url": disc["instagram_profile_pic"],
+                "page_access_token": disc["page_access_token"],  # Property handles encryption
+                "user_access_token": long_lived_user_token,      # Property handles encryption
+                "connected_at": datetime.utcnow()
+            }
+            
+            if existing:
+                # If account was previously connected by another user, purge previous user's automation data
+                if existing.user_id != current_user.id:
+                    logger.info(
+                        f"Instagram account {existing.id} transferred from user {existing.user_id} to user {current_user.id}. "
+                        f"Purging previous user's automation data."
+                    )
+                    from sqlalchemy import delete, select
+                    from app.models.instagram import Post, CommentEvent, DMAutomation
+                    from app.models.automation import AutomationFlow
+                    from app.models.log import AutomationLog
+
+                    post_ids_res = await db.execute(select(Post.id).where(Post.instagram_account_id == existing.id))
+                    post_ids = [r[0] for r in post_ids_res.fetchall()]
+                    if post_ids:
+                        await db.execute(delete(CommentEvent).where(CommentEvent.media_id.in_(post_ids)))
+                        await db.execute(delete(AutomationLog).where(AutomationLog.flow_id.in_(
+                            select(AutomationFlow.id).where(AutomationFlow.instagram_account_id == existing.id)
+                        )))
+
+                    await db.execute(delete(AutomationFlow).where(AutomationFlow.instagram_account_id == existing.id))
+                    await db.execute(delete(DMAutomation).where(DMAutomation.instagram_account_id == existing.id))
+                    await db.commit()
+
+                # If connected Instagram account changed for this Page, purge stale posts from old account
+                elif existing.instagram_business_account_id != disc["instagram_business_account_id"]:
+                    logger.info(
+                        f"Instagram account changed on page {disc['page_id']}: "
+                        f"{existing.instagram_business_account_id} -> {disc['instagram_business_account_id']}. Purging old posts."
+                    )
+                    from sqlalchemy import delete, or_
+                    from app.models.instagram import Post
+                    await db.execute(
+                        delete(Post).where(
+                            Post.instagram_account_id == existing.id,
+                            or_(Post.is_future_post.is_(False), Post.is_future_post.is_(None))
+                        )
+                    )
+                    await db.commit()
+
+                # Update existing account credentials & info
+                account = await instagram_account_repo.update(db, db_obj=existing, obj_in=account_data)
+            else:
+                # Create new account connection
+                account = await instagram_account_repo.create(db, obj_in=account_data)
+                
+            await db.commit()
+            await db.refresh(account)
+
+            # Clean up any stale/duplicate Instagram accounts for the same page_id or user_id
+            from sqlalchemy import select, or_
+            from app.models.instagram import InstagramAccount
+            stale_stmt = select(InstagramAccount).where(
+                InstagramAccount.user_id == current_user.id,
+                or_(
+                    InstagramAccount.page_id == disc["page_id"],
+                    InstagramAccount.instagram_business_account_id == disc["instagram_business_account_id"]
+                ),
+                InstagramAccount.id != account.id
+            )
+            stale_res = await db.execute(stale_stmt)
+            for stale_acc in stale_res.scalars().all():
+                await db.delete(stale_acc)
+            await db.commit()
+
+            saved_accounts.append(account)
+            saved_page_ids.add(disc["page_id"])
+            
+            # Step 4: Sync posts in background (cache recent media)
+            try:
+                posts_data = await meta_client.get_instagram_posts(
+                    instagram_business_account_id=account.instagram_business_account_id,
+                    page_access_token=account.page_access_token
+                )
+                synced_ids = set()
+                for post in posts_data:
+                    synced_ids.add(post["id"])
+                    existing_post = await post_repo.get(db, post["id"])
+                    
+                    raw_ts = post.get("timestamp") or post.get("created_time") or post.get("created_at")
+                    ts_val = parse_iso_timestamp(raw_ts)
+
+                    post_in = {
+                        "id": post["id"],
+                        "instagram_account_id": account.id,
+                        "caption": post.get("caption"),
+                        "media_type": post.get("media_type"),
+                        "media_url": post.get("media_url"),
+                        "permalink": post.get("permalink"),
+                    }
+                    if ts_val is not None:
+                        post_in["timestamp"] = ts_val
+                    elif not existing_post or existing_post.timestamp is None:
+                        post_in["timestamp"] = datetime.utcnow()
+
+                    if existing_post:
+                        await post_repo.update(db, db_obj=existing_post, obj_in=post_in)
+                    else:
+                        await post_repo.create(db, obj_in=post_in)
+
+                # Prune any stale posts that no longer belong to this account
+                from sqlalchemy import delete, or_
+                from app.models.instagram import Post
+                delete_stmt = delete(Post).where(
+                    Post.instagram_account_id == account.id,
+                    Post.id.not_in(synced_ids),
+                    or_(Post.is_future_post.is_(False), Post.is_future_post.is_(None))
+                )
+                await db.execute(delete_stmt)
+                await db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to sync initial posts for account {account.username}: {str(e)}")
+
+        # Prune any existing Instagram accounts for this user whose page was NOT in this connection flow
+        if saved_page_ids:
+            from sqlalchemy import delete
+            from app.models.instagram import InstagramAccount
+            prune_stmt = delete(InstagramAccount).where(
+                InstagramAccount.user_id == current_user.id,
+                InstagramAccount.page_id.not_in(saved_page_ids)
+            )
+            await db.execute(prune_stmt)
+            await db.commit()
+
+        return saved_accounts
+
+    except HTTPException:
+        raise
+    except MetaAPIError as e:
+        logger.error(f"Meta OAuth connection failed: {e.message}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Meta integration failed: {e.message}"
+        )
+    except Exception as e:
+        logger.error(f"OAuth transaction error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal connection failure: {str(e)}"
+        )
+
+
+@router.post("/facebook-connect-page", response_model=List[FacebookAccountSchema])
+async def facebook_connect_page(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+    payload: MetaOAuthPayload
+) -> Any:
+    """
+    Connect user's Facebook account & Pages:
+    1. Exchange short-lived token for a long-lived user token.
+    2. Automatically discover Pages.
+    3. Encrypt and save Pages in the DB.
+    4. Fetch and cache recent feed/posts for each discovered Page.
+    """
+    try:
+        # Step 1: Exchange user token
+        long_lived_user_token = await meta_client.get_long_lived_user_token(payload.access_token)
+        
+        # Step 2: Auto-discover Facebook Pages
+        discovered_pages = await meta_client.discover_facebook_pages(long_lived_user_token)
+        
+        if not discovered_pages:
+            raise HTTPException(
+                status_code=400,
+                detail="No Facebook Pages found. Please verify page setup."
+            )
+            
+        saved_accounts = []
+        saved_page_ids = set()
+        for disc in discovered_pages:
+            # Check if account already connected
+            existing = await facebook_account_repo.get_by_page_id(
+                db, facebook_page_id=disc["facebook_page_id"]
+            )
+            
+            account_data = {
+                "user_id": current_user.id,
+                "facebook_page_id": disc["facebook_page_id"],
+                "username": disc["username"],
+                "name": disc["name"],
+                "profile_picture_url": disc["profile_picture_url"],
+                "page_access_token": disc["page_access_token"],
+                "connected_at": datetime.utcnow()
+            }
+            
+            if existing:
+                if existing.user_id != current_user.id:
+                    logger.info(
+                        f"Facebook account {existing.id} transferred from user {existing.user_id} to user {current_user.id}. "
+                        f"Purging previous user's automation data."
+                    )
+                    from sqlalchemy import delete, select
+                    from app.models.facebook import FacebookPost, FacebookCommentEvent
+                    from app.models.automation import AutomationFlow
+                    from app.models.log import AutomationLog
+
+                    post_ids_res = await db.execute(select(FacebookPost.id).where(FacebookPost.facebook_account_id == existing.id))
+                    post_ids = [r[0] for r in post_ids_res.fetchall()]
+                    if post_ids:
+                        await db.execute(delete(FacebookCommentEvent).where(FacebookCommentEvent.media_id.in_(post_ids)))
+                        await db.execute(delete(AutomationLog).where(AutomationLog.flow_id.in_(
+                            select(AutomationFlow.id).where(AutomationFlow.facebook_account_id == existing.id)
+                        )))
+                    await db.execute(delete(AutomationFlow).where(AutomationFlow.facebook_account_id == existing.id))
+                    await db.commit()
+
+                account = await facebook_account_repo.update(db, db_obj=existing, obj_in=account_data)
+            else:
+                account = await facebook_account_repo.create(db, obj_in=account_data)
+                
+            await db.commit()
+            await db.refresh(account)
+
+            # Clean up any duplicate facebook accounts for the same page_id
+            from sqlalchemy import select
+            from app.models.facebook import FacebookAccount
+            stale_stmt = select(FacebookAccount).where(
+                FacebookAccount.user_id == current_user.id,
+                FacebookAccount.facebook_page_id == disc["facebook_page_id"],
+                FacebookAccount.id != account.id
+            )
+            stale_res = await db.execute(stale_stmt)
+            for stale_acc in stale_res.scalars().all():
+                await db.delete(stale_acc)
+            await db.commit()
+
+            saved_accounts.append(account)
+            saved_page_ids.add(disc["facebook_page_id"])
+            
+            # Step 4: Sync posts in background (cache recent media)
+            try:
+                posts_data = await meta_client.get_facebook_posts(
+                    page_id=account.facebook_page_id,
+                    page_access_token=account.page_access_token
+                )
+                synced_ids = set()
+                for post in posts_data:
+                    synced_ids.add(post["id"])
+                    existing_post = await facebook_post_repo.get(db, post["id"])
+                    
+                    raw_ts = post.get("timestamp") or post.get("created_time") or post.get("created_at")
+                    ts_val = parse_iso_timestamp(raw_ts)
+
+                    post_in = {
+                        "id": post["id"],
+                        "facebook_account_id": account.id,
+                        "caption": post.get("caption"),
+                        "media_type": post.get("media_type"),
+                        "media_url": post.get("media_url"),
+                        "thumbnail_url": post.get("thumbnail_url"),
+                        "permalink": post.get("permalink"),
+                    }
+                    if ts_val is not None:
+                        post_in["timestamp"] = ts_val
+                    elif not existing_post or existing_post.timestamp is None:
+                        post_in["timestamp"] = datetime.utcnow()
+
+                    if existing_post:
+                        await facebook_post_repo.update(db, db_obj=existing_post, obj_in=post_in)
+                    else:
+                        await facebook_post_repo.create(db, obj_in=post_in)
+
+                # Prune any stale posts that no longer belong to this Facebook page
+                from sqlalchemy import delete, or_
+                from app.models.facebook import FacebookPost
+                delete_stmt = delete(FacebookPost).where(
+                    FacebookPost.facebook_account_id == account.id,
+                    FacebookPost.id.not_in(synced_ids),
+                    or_(FacebookPost.is_future_post.is_(False), FacebookPost.is_future_post.is_(None))
+                )
+                await db.execute(delete_stmt)
+                await db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to sync initial Facebook posts for page {account.name}: {str(e)}")
+
+        # Prune any previous Facebook pages for this user that were NOT selected in this connection flow
+        if saved_page_ids:
+            from sqlalchemy import delete
+            from app.models.facebook import FacebookAccount
+            prune_stmt = delete(FacebookAccount).where(
+                FacebookAccount.user_id == current_user.id,
+                FacebookAccount.facebook_page_id.not_in(saved_page_ids)
+            )
+            await db.execute(prune_stmt)
+            await db.commit()
+
+        return saved_accounts
+
+    except HTTPException:
+        raise
+    except MetaAPIError as e:
+        logger.error(f"Meta OAuth Page connection failed: {e.message}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Meta integration failed: {e.message}"
+        )
+    except Exception as e:
+        logger.error(f"OAuth page transaction error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal connection failure: {str(e)}"
+        )
+
+
+@router.get("/meta-config")
+async def get_meta_config() -> Any:
+    """Retrieve public Meta configuration (e.g. App ID)."""
+    return {
+        "app_id": settings.META_APP_ID,
+        "scopes": settings.META_OAUTH_SCOPES
+    }
