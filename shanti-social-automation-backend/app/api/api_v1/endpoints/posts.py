@@ -125,7 +125,7 @@ async def sync_posts(
         try:
             posts_data = await meta_client.get_instagram_posts(
                 instagram_business_account_id=account.instagram_business_account_id,
-                page_access_token=account.effective_access_token, connection_type=account.connection_type
+                page_access_token=account.effective_access_token
             )
             synced_ids = set()
             for post in posts_data:
@@ -208,7 +208,7 @@ async def read_post_comments(
     try:
         meta_comments = await meta_client.get_instagram_comments(
             media_id=post_id,
-            page_access_token=account.effective_access_token, connection_type=account.connection_type
+            page_access_token=account.effective_access_token
         )
         for mc in meta_comments:
             existing_comment = await comment_repo.get(db, id=mc["id"])
@@ -344,7 +344,7 @@ async def delete_comment_endpoint(
     try:
         try:
             success = await meta_client.delete_comment(
-                page_access_token=account.effective_access_token, connection_type=account.connection_type,
+                page_access_token=account.effective_access_token,
                 comment_id=comment_id
             )
             if not success:
@@ -428,7 +428,7 @@ async def sync_facebook_posts(
         try:
             posts_data = await meta_client.get_facebook_posts(
                 page_id=account.facebook_page_id,
-                page_access_token=account.effective_access_token, connection_type=account.connection_type
+                page_access_token=account.effective_access_token
             )
             synced_ids = set()
             for post in posts_data:
@@ -498,7 +498,7 @@ async def read_facebook_post_comments(
     try:
         meta_comments = await meta_client.get_facebook_comments(
             post_id=post_id,
-            page_access_token=account.effective_access_token, connection_type=account.connection_type
+            page_access_token=account.effective_access_token
         )
         for mc in meta_comments:
             existing_comment = await facebook_comment_repo.get(db, id=mc["id"])
@@ -638,7 +638,7 @@ async def delete_facebook_comment_endpoint(
     try:
         try:
             success = await meta_client.delete_comment(
-                page_access_token=account.effective_access_token, connection_type=account.connection_type,
+                page_access_token=account.effective_access_token,
                 comment_id=comment_id
             )
             if not success:

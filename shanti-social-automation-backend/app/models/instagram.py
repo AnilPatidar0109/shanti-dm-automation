@@ -41,6 +41,14 @@ class InstagramAccount(Base):
     def user_access_token(self, val: str):
         self._user_access_token = encrypt_token(val) if val else None
 
+    @property
+    def effective_access_token(self) -> str:
+        return self.page_access_token
+
+    @property
+    def connection_type(self) -> str:
+        return "instagram"
+
 
 class Post(Base):
     id = Column(String, primary_key=True, index=True)  # Instagram Media ID

@@ -30,6 +30,14 @@ class FacebookAccount(Base):
     def page_access_token(self, val: str):
         self._page_access_token = encrypt_token(val)
 
+    @property
+    def effective_access_token(self) -> str:
+        return self.page_access_token
+
+    @property
+    def connection_type(self) -> str:
+        return "facebook"
+
 
 class FacebookPost(Base):
     __tablename__ = "facebook_posts"

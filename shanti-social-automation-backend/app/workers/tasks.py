@@ -255,7 +255,7 @@ def scan_future_flows_task():
                     if is_facebook:
                         posts_data = await meta_client.get_facebook_posts(
                             page_id=account.facebook_page_id,
-                            page_access_token=account.effective_access_token, connection_type=account.connection_type
+                            page_access_token=account.effective_access_token
                         )
                         for p in posts_data:
                             existing = await facebook_post_repo.get(db, p["id"])
@@ -279,7 +279,7 @@ def scan_future_flows_task():
                     else:
                         posts_data = await meta_client.get_instagram_posts(
                             instagram_business_account_id=account.instagram_business_account_id,
-                            page_access_token=account.effective_access_token, connection_type=account.connection_type
+                            page_access_token=account.effective_access_token
                         )
                         for p in posts_data:
                             existing = await post_repo.get(db, p["id"])
