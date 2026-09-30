@@ -15,25 +15,30 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     allowedHosts: [
+      'shanti-dm-automation.onrender.com',
       'cyclonic-sam-difficultly.ngrok-free.dev',
       '.ngrok-free.dev',
       '.ngrok-free.app',
       '.ngrok.io',
+      '.onrender.com',
       'localhost',
       '127.0.0.1'
     ],
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true
+        target: 'https://shanti-dm-automation.onrender.com',
+        changeOrigin: true,
+        secure: false
       },
       '/webhooks': {
-        target: 'http://localhost:8000',
-        changeOrigin: true
+        target: 'https://shanti-dm-automation.onrender.com',
+        changeOrigin: true,
+        secure: false
       },
       '/uploads': {
-        target: 'http://localhost:8000',
-        changeOrigin: true
+        target: 'https://shanti-dm-automation.onrender.com',
+        changeOrigin: true,
+        secure: false
       }
     }
   }
