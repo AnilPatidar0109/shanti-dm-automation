@@ -174,7 +174,15 @@ app = FastAPI(
 # Set all CORS enabled origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "https://shanti-dm-automation.vercel.app",
+        "https://shanti-social-automation-frontend.vercel.app",
+        "https://shanti-dm-automation.onrender.com"
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_headers=["*"],
     allow_methods=["*"],

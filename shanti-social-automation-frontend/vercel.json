@@ -1,0 +1,20 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://shanti-dm-automation.onrender.com/api/:path*"
+    },
+    {
+      "source": "/webhooks/:path*",
+      "destination": "https://shanti-dm-automation.onrender.com/webhooks/:path*"
+    },
+    {
+      "source": "/uploads/:path*",
+      "destination": "https://shanti-dm-automation.onrender.com/uploads/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
